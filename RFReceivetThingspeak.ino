@@ -1,27 +1,25 @@
 /*
-Simple RF receiver and poster to Xively
+Simple RF receiver and poster to thingspeak.com
  
- Receives date from RF transpotter [RFTransmitter.ino] and posts it to Xively using ethernet.
+ Receives date from RF transpotter [RFTransmitter.ino] and posts it to thingspeak.com using ethernet.
  
  To see debug messages set variable serialInit to true. Will initiate Serial and prinr messages.
  For standalone mode set serialInit=false;
  
  Arduino pinout
- ------------------------------- 
- +5v       ->  DHT Vcc
- PIN 9     ->  DHT data pin
- GND       ->  DHT GND pin
- 
+ -------------------------------  
  +5v       ->  RF receiver Vcc
  PIN 12    ->  RF receiver Data pin
  GND       ->  RF receiver GND
  
  PIN 13    ->  Receive LED indicator 
+
+ PIN 2     ->  RELAY for reating
  ------------------------------- 
  
  Created By: Aleksei Ivanov
  Creation Date: 2015/05/23
- Last Updated Date:2015/05/23 
+ Last Updated Date:2021/01/02 
  */
 
 #include <SPI.h>
@@ -30,8 +28,11 @@ Simple RF receiver and poster to Xively
 #include <VirtualWire.h>  //Library Required
 
 
-boolean serialInit = false;
+boolean serialInit = true;
 
+long RELAY_SET_TIME; // relay status change timestamp millis()
+long RELAY_DELAY_LIMIT = 1000*60*5; //relay on for 5 min if no further signals arrive
+int HEATING_RELAY_PIN = 2;//Relay pin to set high in order to close relay and set low to open/disconnect
 
 String sFields;
 
@@ -56,13 +57,11 @@ typedef struct roverRemoteData //Data Structure
 // MAC address for your Ethernet shield
 byte mac[] = { 
   0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip(192,168,1,20);
 
 // Your ThingsSpeak API key to let you upload data
-
-String sApiKeys[] = {"","I6HAV4GQBQK6390H","I6HAV4GQBQK6390H","I6HAV4GQBQK6390H"};
+String sApiKeys[] = {"","apiKey1","apiKey2","apiKey3"};
 long lThingTimers[] = {0,0,0,0};
-long lDelayLimit=25000L;
+long lDelayLimit=25000L; //send sensor data to web not more often than every 25sec 
 
 EthernetClient client;
 
@@ -73,9 +72,13 @@ void setup() {
   if (serialInit)Serial.begin(9600);// Begin Serial port at a Buad speed of 9600bps 
   if (serialInit)Serial.println("Setup start");
 
-  pinMode(13, OUTPUT);            
+  pinMode(13, OUTPUT);     
+  pinMode(HEATING_RELAY_PIN,OUTPUT);
+  setRelayOFF();//initially RELAY OFF - open     
+  
+ 
 
-  vw_set_ptt_inverted(true); // Required for DR3100
+  //vw_set_ptt_inverted(true); // Required for DR3100
   vw_set_rx_pin(RX_PIN);// Set RX Pin 
   vw_setup(4000);// Setup and Begin communication over the radios at 2000bps( MIN Speed is 1000bps MAX 4000bps)
   vw_rx_start(); 
@@ -84,9 +87,11 @@ void setup() {
 
   if(Ethernet.begin(mac)==1) {
     if (serialInit)Serial.println("Ethernet connect Successful");
+    if (serialInit)Serial.print("IP:");
+    if (serialInit)Serial.println(Ethernet.localIP());
   }
   else{
-    if (serialInit)Serial.println("Error getting IP address via DHCP, try again by re...");
+    if (serialInit)Serial.println("Error getting IP address via DHCP, try again by resetting...");
   }
 
 }  
@@ -98,7 +103,12 @@ void setup() {
 void loop(){
   sFields="";
   //digitalWrite(13,LOW);  
+  
+  
+  //relay reset
+  setRelayReset();
 
+  
   struct roverRemoteData receivedData;
   uint8_t rcvdSize = sizeof(receivedData);//Incoming data size 
   vw_wait_rx();// Start to Receive data now 
@@ -114,7 +124,19 @@ void loop(){
       sFields=sFields+"&2="+getFString(receivedData.Sensor2Data);
       sFields=sFields+"&3="+getFString(receivedData.Sensor3Data);
       sFields=sFields+"&4="+getFString(receivedData.Sensor4Data);
-      
+
+      // RELAY control based on battery powered temperature sensor
+      if (receivedData.TX_ID == 2 ){
+        //
+        if((receivedData.Sensor1Data) == 1.0) {
+          //turn relay on for 30sec
+         setRelayON();
+        }else{
+          //turn relay off for other cases 
+          setRelayOFF();
+        }
+      }
+
       if (receivedData.API_KEY != ""){
         sendHttpGet(receivedData.API_KEY, sFields,0); //send to ThingsSpeak
       }
@@ -154,6 +176,36 @@ void loop(){
 }
 
 
+
+/*---------------------------------------------------------------------------------
+ -- setRelayON
+ -- - set RELAY ON - closed status  
+ ---------------------------------------------------------------------------------*/
+void setRelayON(){  
+          digitalWrite(HEATING_RELAY_PIN,LOW);
+          RELAY_SET_TIME = millis();
+          if (serialInit)Serial.println("   --> RELAY SET ON");
+}
+
+/*---------------------------------------------------------------------------------
+ -- setRelayOFF
+ -- - set RELAY OFF - open status  
+ ---------------------------------------------------------------------------------*/
+void setRelayOFF(){  
+          digitalWrite(HEATING_RELAY_PIN,HIGH);
+          RELAY_SET_TIME = millis();
+          if (serialInit)Serial.println("   --> RELAY SET OFF");
+}
+/*---------------------------------------------------------------------------------
+ -- setRelayReset
+ -- - after given delay_limit reset RELAY OFF - open status  
+ ---------------------------------------------------------------------------------*/
+void setRelayReset(){  
+  //relay reset
+  if(millis() - RELAY_SET_TIME > RELAY_DELAY_LIMIT){    
+         setRelayOFF();
+  }
+}
 /*---------------------------------------------------------------------------------
  -- getFString
  -- - Converts float to string
@@ -172,31 +224,19 @@ void sendHttpGet(String pApiKey, String pFields,int n){
   if (serialInit)Serial.println(pApiKey+": "+pFields);
 
     if(millis()-lThingTimers[n]  > lDelayLimit || millis()-lThingTimers[n]  < 0L){
-		lThingTimers[n]=millis();
-	}else{  
-		return;
-	}
+    lThingTimers[n]=millis();
+  }else{  
+    return;
+  }
   if (client.connect("api.thingspeak.com", 80))
   {
     if (serialInit)Serial.println("connected to thingspeak..");
-    //client.println("GET /update?key="+pApiKey+pFields+" HTTP/1.1");//sApiKeys(2)
-    client.println("GET /update?key="+sApiKeys[n]+pFields+" HTTP/1.1");//
-    client.println("Host: api.thingspeak.com");
-    //client.println("Host: 184.106.153.149");
+    if (serialInit)Serial.println("GET /update?api_key="+sApiKeys[n]+pFields+" HTTP/1.1");
+    client.println("GET /update?api_key="+sApiKeys[n]+pFields+" HTTP/1.1");//
+    client.println("Host: api.thingspeak.com"); //client.println("Host: 184.106.153.149");
     client.println("Connection: close");
     client.println();
-
-    /* client.print("POST /update HTTP/1.1\n");
-     //client.print("Host: api.thingspeak.com\n");
-     client.println("Host: 184.106.153.149");
-     client.print("Connection: close\n");
-     client.print("X-THINGSPEAKAPIKEY: " + pApiKey + "\n");
-     client.print("Content-Type: application/x-www-form-urlencoded\n");
-     client.print("Content-Length: ");
-     client.print(pFields.length());
-     client.print("\n\n");
-     client.print(pFields);
-     */
+   
     delay(1000);
     if (client.connected())
     {
@@ -227,7 +267,7 @@ void sendHttpGet(String pApiKey, String pFields,int n){
         if (serialInit)Serial.println("Ethernet connect Successful");
       }
       else{
-        if (serialInit)Serial.println("Error getting IP address via DHCP, try again by re...");
+        if (serialInit)Serial.println("Error getting IP address via DHCP, try again by resetting...");
       }
     }
   }
